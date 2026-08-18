@@ -32,7 +32,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define CANYON_VERSION "1.0.0"
+#define CANYON_VERSION "1.1.0"
 
 #define DEFAULT_RANDOM_SOURCE "/dev/urandom"
 #define DEFAULT_OUTDIR "canyon-logs"
@@ -55,6 +55,18 @@ typedef struct {
     int proxy_port;
     char *proxy_user;
     char *proxy_pass;
+
+    /* websocket / http */
+    bool websocket;
+    bool http;
+    char *path;
+    bool ws_text;
+
+    /* tls */
+    bool tls;
+    bool tls_verify;
+    char *tls_ca;
+    char *sni;
 
     /* traffic shaping */
     char *random_source;
@@ -87,5 +99,8 @@ void die(const char *fmt, ...) __attribute__((format(printf, 1, 2))) __attribute
 uint64_t now_ms(void);
 void sleep_us(long us);
 int mkdir_p(const char *path, mode_t mode);
+
+/* Returns true when host is an IPv4/IPv6 literal (not a hostname). */
+bool is_ip_literal(const char *host);
 
 #endif /* CANYON_H */
