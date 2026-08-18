@@ -7,11 +7,28 @@
 
 #include <openssl/err.h>
 #include <openssl/x509.h>
+#include <poll.h>
+
+/* Wait (without holding the conn mutex) for the socket to become ready.
+ * Returns true when ready, false on timeout/error. */
+static bool tls_wait_fd(conn_t *c, short events, int timeout_ms)
+{
+    struct pollfd p;
+    int r;
+
+    p.fd = c->fd;
+    p.events = events;
+    do {
+        r = poll(&p, 1, timeout_ms);
+    } while (r < 0 && errno == EINTR);
+    return r > 0;
+}
 
 void conn_init(conn_t *c, int fd)
 {
     c->fd = fd;
     c->ssl = NULL;
+    pthread_mutex_init(&c->lock, NULL);
 }
 
 bool conn_is_tls(conn_t *c)
@@ -21,7 +38,14 @@ bool conn_is_tls(conn_t *c)
 
 bool conn_has_pending(conn_t *c)
 {
-    return c->ssl != NULL && SSL_pending(c->ssl) > 0;
+    int n;
+
+    if (!c->ssl)
+        return false;
+    pthread_mutex_lock(&c->lock);
+    n = SSL_pending(c->ssl);
+    pthread_mutex_unlock(&c->lock);
+    return n > 0;
 }
 
 int conn_tls(conn_t *c, const char *sni, const char *verify_name,
@@ -76,8 +100,12 @@ int conn_tls(conn_t *c, const char *sni, const char *verify_name,
     if (verify && verify_name)
         SSL_set1_host(ssl, verify_name);
 
-    if (SSL_connect(ssl) != 1) {
-        unsigned long e = ERR_get_error();
+    pthread_mutex_lock(&c->lock);
+    int cr = SSL_connect(ssl);
+    unsigned long e = cr == 1 ? 0 : ERR_get_error();
+    pthread_mutex_unlock(&c->lock);
+
+    if (cr != 1) {
         char ebuf[256];
         if (e == 0)
             snprintf(ebuf, sizeof ebuf, "connection closed during handshake");
@@ -94,6 +122,18 @@ int conn_tls(conn_t *c, const char *sni, const char *verify_name,
         return -1;
     }
 
+    /* Switch the socket to non-blocking mode. From here on SSL_read and
+     * SSL_write never block while holding the conn mutex: WANT_READ and
+     * WANT_WRITE are handled with poll() outside the lock, which lets the
+     * sender and receiver threads coexist safely on the same SSL object. */
+    int fl = fcntl(c->fd, F_GETFL, 0);
+    if (fl < 0 || fcntl(c->fd, F_SETFL, fl | O_NONBLOCK) != 0) {
+        snprintf(err, errlen, "tls: cannot set non-blocking mode: %s",
+                 strerror(errno));
+        SSL_free(ssl);
+        return -1;
+    }
+
     c->ssl = ssl;
     return 0;
 }
@@ -103,15 +143,29 @@ ssize_t conn_send(conn_t *c, const void *buf, size_t n)
     if (!c->ssl)
         return send(c->fd, buf, n, MSG_NOSIGNAL);
 
-    int r;
     for (;;) {
+        int r;
+        int e = 0;
+
+        pthread_mutex_lock(&c->lock);
         r = SSL_write(c->ssl, buf, (int)(n > INT_MAX ? INT_MAX : n));
+        if (r <= 0)
+            e = SSL_get_error(c->ssl, r);
+        pthread_mutex_unlock(&c->lock);
+
         if (r > 0)
             return (ssize_t)r;
-        int e = SSL_get_error(c->ssl, r);
-        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
-            struct timespec ts = { 0, 10000000 };
-            nanosleep(&ts, NULL);
+        if (e == SSL_ERROR_WANT_READ) {
+            /* A post-handshake message (e.g. a TLS 1.3 ticket) must be read
+             * before we may write again. Wait on POLLIN without the lock so
+             * the receiver thread can drain it. */
+            if (!tls_wait_fd(c, POLLIN, 1000))
+                return -1;
+            continue;
+        }
+        if (e == SSL_ERROR_WANT_WRITE) {
+            if (!tls_wait_fd(c, POLLOUT, 5000))
+                return -1;
             continue;
         }
         return -1;
@@ -124,13 +178,30 @@ ssize_t conn_recv(conn_t *c, void *buf, size_t n)
         return recv(c->fd, buf, n, 0);
 
     for (;;) {
-        int r = SSL_read(c->ssl, buf, (int)(n > INT_MAX ? INT_MAX : n));
+        int r;
+        int e = 0;
+
+        pthread_mutex_lock(&c->lock);
+        r = SSL_read(c->ssl, buf, (int)(n > INT_MAX ? INT_MAX : n));
+        if (r <= 0)
+            e = SSL_get_error(c->ssl, r);
+        pthread_mutex_unlock(&c->lock);
+
         if (r > 0)
             return (ssize_t)r;
-        int e = SSL_get_error(c->ssl, r);
-        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
-            errno = EAGAIN;
-            return -1;
+        if (e == SSL_ERROR_WANT_READ) {
+            if (!tls_wait_fd(c, POLLIN, 5000)) {
+                errno = EAGAIN;
+                return -1;
+            }
+            continue;
+        }
+        if (e == SSL_ERROR_WANT_WRITE) {
+            if (!tls_wait_fd(c, POLLOUT, 5000)) {
+                errno = EAGAIN;
+                return -1;
+            }
+            continue;
         }
         if (e == SSL_ERROR_ZERO_RETURN)
             return 0;
@@ -160,17 +231,23 @@ ssize_t conn_send_all(conn_t *c, const void *buf, size_t n)
 
 void conn_shutdown(conn_t *c)
 {
-    if (c->ssl)
+    if (c->ssl) {
+        pthread_mutex_lock(&c->lock);
         SSL_shutdown(c->ssl);
+        pthread_mutex_unlock(&c->lock);
+    }
     shutdown(c->fd, SHUT_RDWR);
 }
 
 void conn_close(conn_t *c)
 {
     if (c->ssl) {
+        pthread_mutex_lock(&c->lock);
         SSL_free(c->ssl);
         c->ssl = NULL;
+        pthread_mutex_unlock(&c->lock);
     }
+    pthread_mutex_destroy(&c->lock);
     if (c->fd >= 0) {
         close(c->fd);
         c->fd = -1;

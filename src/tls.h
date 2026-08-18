@@ -12,6 +12,7 @@
 #ifndef CANYON_TLS_H
 #define CANYON_TLS_H
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/types.h>
@@ -21,6 +22,7 @@
 typedef struct {
     int fd;
     SSL *ssl;
+    pthread_mutex_t lock;
 } conn_t;
 
 /*
@@ -28,6 +30,13 @@ typedef struct {
  * The fd is owned by the conn_t from now on.
  */
 void conn_init(conn_t *c, int fd);
+
+/*
+ * conn_t may be used from two threads concurrently (canyon runs a sender
+ * and a receiver thread on the same connection). All SSL_* calls are
+ * serialised internally with a mutex; OpenSSL SSL objects are not safe
+ * for concurrent SSL_read/SSL_write on the same SSL*.
+ */
 
 /*
  * Upgrade the connection to TLS (client handshake).
