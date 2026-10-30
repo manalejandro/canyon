@@ -25,6 +25,25 @@ typedef struct {
 
 static logbook_t lb;
 
+static logbook_bytes_sink_t s_stream_sink;
+static logbook_bytes_sink_t s_dgram_sink;
+static logbook_event_sink_t s_event_sink;
+
+void logbook_set_stream_sink(logbook_bytes_sink_t fn)
+{
+    s_stream_sink = fn;
+}
+
+void logbook_set_dgram_sink(logbook_bytes_sink_t fn)
+{
+    s_dgram_sink = fn;
+}
+
+void logbook_set_event_sink(logbook_event_sink_t fn)
+{
+    s_event_sink = fn;
+}
+
 static void json_escape(FILE *f, const char *s)
 {
     for (; *s; s++) {
@@ -101,12 +120,15 @@ void logbook_event(const char *type, const char *fmt, ...)
     char msg[1024];
     va_list ap;
 
-    if (!lb.events)
-        return;
-
     va_start(ap, fmt);
     vsnprintf(msg, sizeof msg, fmt, ap);
     va_end(ap);
+
+    if (s_event_sink)
+        s_event_sink(type, msg);
+
+    if (!lb.events)
+        return;
 
     fprintf(lb.events, "{\"ts\":%llu,\"type\":\"%s\",\"msg\":\"",
             (unsigned long long)now_ms(), type);
@@ -118,6 +140,9 @@ void logbook_event(const char *type, const char *fmt, ...)
 void logbook_stream(const void *data, size_t n)
 {
     char path[2 * PATH_MAX + 128];
+
+    if (s_stream_sink)
+        s_stream_sink(data, n);
 
     if (!lb.stream)
         return;
@@ -146,6 +171,9 @@ void logbook_datagram(const void *data, size_t n,
     char path[2 * PATH_MAX + 128];
     char host[INET6_ADDRSTRLEN] = "?";
     uint16_t port = 0;
+
+    if (s_dgram_sink)
+        s_dgram_sink(data, n);
 
     if (!lb.dgram_dir[0])
         return;

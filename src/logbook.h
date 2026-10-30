@@ -16,6 +16,19 @@
 #include <sys/socket.h>
 
 /*
+ * Observer sinks. When registered, every received byte and every event
+ * is also forwarded to these callbacks (used by the ncurses TUI). They
+ * are called from the sender/receiver threads and must be thread-safe
+ * and non-blocking.
+ */
+typedef void (*logbook_bytes_sink_t)(const void *data, size_t n);
+typedef void (*logbook_event_sink_t)(const char *type, const char *msg);
+
+void logbook_set_stream_sink(logbook_bytes_sink_t fn);
+void logbook_set_dgram_sink(logbook_bytes_sink_t fn);
+void logbook_set_event_sink(logbook_event_sink_t fn);
+
+/*
  * Prepare the log output directory and open the log files.
  * Returns 0 on success, -1 on failure.
  */

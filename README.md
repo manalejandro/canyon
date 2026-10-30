@@ -15,6 +15,12 @@ use a **domain hostname** instead of the raw IP (for SNI, certificate
 verification and the HTTP `Host:` header). Every byte received on the socket
 is persisted to disk.
 
+![canyon interactive TUI](docs/tui.png)
+
+*The interactive TUI (`-T`): a live hexdump of everything the target sends
+back, plus counters, rates and an event log — one screen that never floods
+your terminal.*
+
 > **Disclaimer:** Use canyon only against systems you own or have explicit
 > written authorization to test. You are responsible for what you do with it.
 
@@ -39,7 +45,12 @@ is persisted to disk.
   - Both protocols write a machine-readable **JSONL** `events-<tag>.log`.
 - Configurable runtime limit (`-t`) and chunk budget (`-n`).
 - `--recv-only` / `--no-recv` modes to listen or to flood without listening.
-- No external dependencies beyond POSIX, pthreads, libc and OpenSSL (libssl).
+- Interactive ncurses TUI (`-T`): live hexdump/text view of the received
+  data, sent/recv counters with rates, connection state and an event log on
+  a single screen. Scrollback is bounded and repaints are throttled, so a
+  full-speed flood never spams the terminal; disk logging is unaffected.
+- No external dependencies beyond POSIX, pthreads, libc and OpenSSL (libssl);
+  ncurses is optional (the TUI is stubbed out when its headers are missing).
 
 ## Build
 
@@ -51,7 +62,9 @@ sudo make install   # installs to /usr/local/bin
 
 Requires a C11 compiler, `pthreads` (glibc/musl) and OpenSSL development
 headers (`libssl-dev` / `openssl-devel`). `pkg-config` is used to find the
-OpenSSL flags when available.
+OpenSSL flags when available. For the interactive TUI (`-T`) the ncurses
+development headers are used when present (`libncursesw-dev` /
+`ncurses-devel`); without them canyon still builds, with the TUI stubbed out.
 
 ## Usage
 
@@ -92,6 +105,7 @@ The only required option is the target port. A target host defaults to
 | `-m, --max-log <bytes>` | Max size per received-data log file (TCP stream rollover). |
 | `-N, --no-recv` | Do not read anything from the socket. |
 | `-E, --recv-only` | Only read from the socket, do not send. |
+| `-T, --tui` | Interactive ncurses interface: live hexdump of the received data, stats and event log. Falls back to log mode when not attached to a terminal. |
 | `-v, --verbose` | Verbose output. |
 | `-q, --quiet` | Suppress informational output. |
 | `-V, --version` | Print version and exit. |
@@ -132,7 +146,46 @@ canyon -p 12345 -E -t 10
 
 # Use /dev/random as the byte source and stop after 1000 chunks
 canyon -p 8080 -r /dev/random -n 1000 -o /var/log/canyon
+
+# Watch the session live in the ncurses TUI (received data, stats, events)
+canyon -T -p 8080
+canyon -T -p 443 -H example.com -s -w --path /ws
 ```
+
+## Interactive TUI (`-T`)
+
+With `-T` canyon takes over the terminal with an ncurses interface instead of
+printing logs to it. Everything the target sends back is visible as it
+arrives, without flooding the screen:
+
+- **title bar** — version, target, protocol/mode and connection state;
+- **stats bar** — uptime, chunks/bytes sent and messages/bytes received with
+  live rates;
+- **data pane** — scrolling hexdump (or wrapped text) of the received bytes;
+  the last 1 MiB stays available as scrollback;
+- **events pane** — connects/disconnects, TLS/WebSocket/HTTP metadata, errors
+  and verbose logs (last 1024 lines);
+- **help bar** — the available keys.
+
+The screen repaints at a fixed rate no matter how fast data arrives, and disk
+logging (`stream-*.log`, `datagrams-*/`, `events-*.log`) continues exactly as
+in log mode. `q` quits cleanly (same as Ctrl-C).
+
+| Key | Action |
+| --- | --- |
+| `q` | Quit (equivalent to Ctrl-C). |
+| `p` | Pause / resume sending (the status bar shows `PAUSED`). |
+| `x` | Toggle hexdump / text view of the received data. |
+| `c` | Clear the on-screen scrollback (counters and disk logs are kept). |
+| `Tab` | Move the scroll focus between the data and events panes. |
+| `↑` `↓` `PgUp` `PgDn` | Scroll the focused pane away from / towards the live tail. |
+| `Home` / `End` | Jump to the oldest buffered line / back to live. |
+| mouse wheel / click | Scroll / focus the pane under the cursor. |
+| `Ctrl-L` | Force a full repaint. |
+
+If stdin or stdout is not a terminal (pipes, CI, `nohup`), canyon prints a
+warning and continues in the classic log mode; the same happens when the
+terminal is too small (< 48x10) or when canyon was built without ncurses.
 
 ## Logging
 
@@ -234,7 +287,10 @@ echo servers with a locally generated certificate) and verifies that canyon:
    and rejects untrusted certificates;
 9. speaks WSS against a TLS-wrapped WebSocket echo server;
 10. sends an HTTP `GET` to a path endpoint using the `--sni` hostname in the
-    `Host:` header.
+    `Host:` header;
+11. falls back to classic log mode when `-T` is used without a terminal;
+12. runs `-T` inside a pty, shows the received data on screen, honours the
+    `x`/`p` keys and quits cleanly on `q`.
 
 ## Project layout
 
@@ -246,7 +302,9 @@ src/rand.c       random byte source + PRNG for sizes/delays
 src/logbook.c    received-data and event logging
 src/tls.c        TLS/SSL transport abstraction (OpenSSL, conn_t)
 src/ws.c         WebSocket frames and handshake (RFC 6455)
+src/tui.c        interactive ncurses interface (-T)
 tests/smoke.sh   end-to-end smoke tests
+docs/tui.png     screenshot of the interactive TUI
 ```
 
 ## License

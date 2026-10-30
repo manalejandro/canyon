@@ -21,6 +21,7 @@
 #include "rand.h"
 #include "socks5.h"
 #include "tls.h"
+#include "tui.h"
 #include "ws.h"
 
 #include <arpa/inet.h>
@@ -37,6 +38,9 @@ volatile sig_atomic_t g_running = 1;
 static int g_randfd = -1;
 static int g_fd = -1;
 static unsigned long g_sent = 0;
+static unsigned long long g_sent_bytes = 0;
+static unsigned long long g_recv_msgs = 0;
+static unsigned long long g_recv_bytes = 0;
 static bool g_random_dead = false;
 
 #define CONNECT_TIMEOUT_MS 10000
@@ -91,6 +95,12 @@ static const char *usage_text =
     "  -N, --no-recv              do not read anything from the socket\n"
     "  -E, --recv-only            only read from the socket, do not send\n"
     "\n"
+    "Interface:\n"
+    "  -T, --tui                  interactive ncurses interface: live hexdump of\n"
+    "                             the received data, stats and event log, without\n"
+    "                             flooding the terminal (falls back to log mode\n"
+    "                             when not attached to a tty)\n"
+    "\n"
     "Misc:\n"
     "  -v, --verbose              verbose output\n"
     "  -q, --quiet                suppress informational output\n"
@@ -99,6 +109,7 @@ static const char *usage_text =
     "\n"
     "Examples:\n"
     "  canyon -p 8080                        flood a local HTTP port over TCP\n"
+    "  canyon -T -p 8080                     ...and watch it live in the ncurses TUI\n"
     "  canyon -u -p 53 -H 8.8.8.8 -c 512      flood 8.8.8.8:53 over UDP\n"
     "  canyon -p 8080 -x 127.0.0.1:1080       go through a local SOCKS5 proxy\n"
     "  canyon -p 443 -H 1.2.3.4 -s --sni example.com --http --path /api      HTTPS audit\n"
@@ -113,7 +124,20 @@ void logmsg(const char *fmt, ...)
     struct timeval tv;
     struct tm tmv;
     char ts[32];
+    char msg[1024];
     va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+
+    /* With the TUI running the screen belongs to ncurses: route the
+     * message to the event pane instead of corrupting the display. */
+    if (tui_active()) {
+        if (!opts.quiet)
+            tui_event("log", msg);
+        return;
+    }
 
     if (opts.quiet)
         return;
@@ -122,16 +146,14 @@ void logmsg(const char *fmt, ...)
     localtime_r(&tv.tv_sec, &tmv);
     strftime(ts, sizeof ts, "%H:%M:%S", &tmv);
 
-    fprintf(stderr, "[%s.%03ld] ", ts, tv.tv_usec / 1000);
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    fputc('\n', stderr);
+    fprintf(stderr, "[%s.%03ld] %s\n", ts, tv.tv_usec / 1000, msg);
 }
 
 void die(const char *fmt, ...)
 {
     va_list ap;
+
+    tui_shutdown();             /* restore the terminal before printing */
 
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
@@ -157,6 +179,18 @@ void sleep_us(long us)
     ts.tv_sec = us / 1000000L;
     ts.tv_nsec = (us % 1000000L) * 1000L;
     nanosleep(&ts, NULL);
+}
+
+/* Sleep in small slices so Ctrl-C / TUI 'q' is honoured quickly even
+ * with long user delays. */
+static void sleep_intr(long us)
+{
+    while (us > 0 && g_running) {
+        long step = us > 50000 ? 50000 : us;
+
+        sleep_us(step);
+        us -= step;
+    }
 }
 
 int mkdir_p(const char *path, mode_t mode)
@@ -193,12 +227,20 @@ bool is_ip_literal(const char *host)
            inet_pton(AF_INET6, host, &a6) == 1;
 }
 
+void canyon_stop(void)
+{
+    int fd;
+
+    g_running = 0;
+    fd = g_fd;
+    if (fd >= 0)
+        shutdown(fd, SHUT_RDWR);
+}
+
 static void on_signal(int sig)
 {
     (void)sig;
-    g_running = 0;
-    if (g_fd >= 0)
-        shutdown(g_fd, SHUT_RDWR);
+    canyon_stop();
 }
 
 static int parse_u64_range(const char *s, unsigned long *lo, unsigned long *hi)
@@ -274,6 +316,7 @@ static const struct option long_opts[] = {
     { "no-recv",         no_argument,       0, 'N' },
     { "recv-only",       no_argument,       0, 'E' },
     { "max-log",         required_argument, 0, 'm' },
+    { "tui",             no_argument,       0, 'T' },
     { "verbose",         no_argument,       0, 'v' },
     { "quiet",           no_argument,       0, 'q' },
     { "version",         no_argument,       0, 'V' },
@@ -309,8 +352,11 @@ static void handle_ws_frame(ws_frame_t *f, conn_t *conn)
     case WS_OP_TEXT:
     case WS_OP_BINARY:
     case WS_OP_CONT:
-        if (f->plen > 0)
+        if (f->plen > 0) {
             logbook_stream(f->payload, f->plen);
+            g_recv_msgs++;
+            g_recv_bytes += f->plen;
+        }
         logbook_event("ws_frame", "opcode=%u len=%zu", f->opcode, f->plen);
         break;
     case WS_OP_CLOSE:
@@ -443,8 +489,11 @@ static void *receiver_thread(void *arg)
             socklen_t sl = sizeof src;
             n = recvfrom(a->conn->fd, buf, sizeof buf, 0,
                          (struct sockaddr *)&src, &sl);
-            if (n >= 0)
+            if (n >= 0) {
                 logbook_datagram(buf, (size_t)n, (struct sockaddr *)&src, sl);
+                g_recv_msgs++;
+                g_recv_bytes += (unsigned long long)n;
+            }
         }
 
         if (n < 0) {
@@ -463,9 +512,11 @@ static void *receiver_thread(void *arg)
             }
         } else if (a->proto == PROTO_TCP) {
             logbook_stream(buf, (size_t)n);
+            g_recv_msgs++;
+            g_recv_bytes += (unsigned long long)n;
         }
 
-        if (opts.verbose)
+        if (opts.verbose && !tui_active())
             logmsg("received %zd bytes", n);
     }
 
@@ -538,7 +589,14 @@ static int sender_loop(conn_t *conn, uint64_t start_ms)
 
     int rc = 0;
     while (g_running && !over_budget(start_ms)) {
-        size_t want = (size_t)rand_range_u(opts.chunk_min, opts.chunk_max);
+        size_t want;
+
+        if (tui_paused()) {
+            sleep_us(50000);
+            continue;
+        }
+
+        want = (size_t)rand_range_u(opts.chunk_min, opts.chunk_max);
         int got = rand_fill(g_randfd, buf, want);
         if (got < 0) {
             logbook_event("random_error", "reading random source: %s",
@@ -579,13 +637,15 @@ static int sender_loop(conn_t *conn, uint64_t start_ms)
         }
 
         g_sent++;
-        if (opts.verbose)
+        g_sent_bytes += (unsigned long long)(sent > 0 ? sent : 0);
+        tui_stat_sent(g_sent, g_sent_bytes);
+        if (opts.verbose && !tui_active())
             logmsg("chunk %lu sent (%zd bytes)", g_sent, sent);
 
         long d = (long)rand_range_u((uint64_t)opts.delay_min_us,
                                     (uint64_t)opts.delay_max_us);
         if (d > 0)
-            sleep_us(d);
+            sleep_intr(d);
     }
 
     free(frame);
@@ -609,6 +669,7 @@ static int tcp_session(void)
         int fd = -1;
         conn_t conn;
 
+        tui_set_state("connecting");
         if (opts.proxy_host) {
             fd = net_connect_tcp(opts.proxy_host, opts.proxy_port,
                                  CONNECT_TIMEOUT_MS, err, sizeof err);
@@ -630,6 +691,7 @@ static int tcp_session(void)
 
         if (fd >= 0 && opts.tls) {
             const char *alpn = opts.websocket ? "http/1.1" : NULL;
+            tui_set_state("tls handshake");
             if (conn_tls(&conn, sni, verify_name, opts.tls_verify,
                          opts.tls_ca, alpn, err, sizeof err) != 0) {
                 logbook_event("tls_error", "%s", err);
@@ -647,6 +709,7 @@ static int tcp_session(void)
             uint64_t a = rand_uint64(), b = rand_uint64();
             memcpy(key, &a, 8);
             memcpy(key + 8, &b, 8);
+            tui_set_state("ws handshake");
             if (ws_handshake(&conn, host_header, opts.port, opts.path,
                              key, spill, &spill_len, sizeof spill,
                              err, sizeof err) != 0) {
@@ -673,12 +736,18 @@ static int tcp_session(void)
             logbook_event("connect_error", "%s", err);
             if (opts.verbose)
                 logmsg("connect failed: %s", err);
-            if (g_running && !over_budget(start))
-                sleep_us(opts.reconnect_delay_us);
+            if (g_running && !over_budget(start)) {
+                tui_set_state("connect failed - retry in %.1fs",
+                              (double)opts.reconnect_delay_us / 1e6);
+                sleep_intr(opts.reconnect_delay_us);
+            } else {
+                tui_set_state("connect failed");
+            }
             continue;
         }
 
         g_fd = conn.fd;
+        tui_set_state("connected");
         logbook_event("connect", "connected to %s:%d %s",
                       opts.host, opts.port,
                       opts.proxy_host ? "(via socks5)" :
@@ -713,13 +782,17 @@ static int tcp_session(void)
         logbook_event("disconnect", "connection closed");
         if (opts.verbose)
             logmsg("connection closed");
+        tui_set_state("disconnected");
 
         if (g_random_dead) {
             rc = 1;
             break;
         }
-        if (g_running && !over_budget(start))
-            sleep_us(opts.reconnect_delay_us);
+        if (g_running && !over_budget(start)) {
+            tui_set_state("reconnecting in %.1fs",
+                          (double)opts.reconnect_delay_us / 1e6);
+            sleep_intr(opts.reconnect_delay_us);
+        }
     }
     return rc;
 }
@@ -736,11 +809,13 @@ static int udp_session(void)
         logbook_event("connect_error", "%s", err);
         if (opts.verbose)
             logmsg("connect failed: %s", err);
+        tui_set_state("connect failed");
         return 1;
     }
 
     conn_init(&conn, fd);
     g_fd = conn.fd;
+    tui_set_state("connected (udp)");
     logbook_event("connect", "connected to %s:%d (udp)", opts.host, opts.port);
     if (opts.verbose)
         logmsg("connected to %s:%d (udp)", opts.host, opts.port);
@@ -775,7 +850,11 @@ static int udp_session(void)
 static void run_sessions(void)
 {
     int rc = (opts.proto == PROTO_TCP) ? tcp_session() : udp_session();
-    logbook_event("end", "shutting down (sent=%lu rc=%d)", g_sent, rc);
+
+    logbook_event("end",
+                  "shutting down (sent=%lu sent_bytes=%llu recv_msgs=%llu "
+                  "recv_bytes=%llu rc=%d)",
+                  g_sent, g_sent_bytes, g_recv_msgs, g_recv_bytes, rc);
     if (opts.verbose)
         logmsg("done: %lu chunks sent", g_sent);
 }
@@ -805,7 +884,7 @@ int main(int argc, char **argv)
     opts.sni = NULL;
 
     while ((c = getopt_long(argc, argv,
-                            "H:p:ux:U:P:swr:c:d:t:n:o:RD:NEvmqVh",
+                            "H:p:ux:U:P:swr:c:d:t:n:o:RD:NEvmTqVh",
                             long_opts, NULL)) != -1) {
         switch (c) {
         case 'H':
@@ -903,6 +982,9 @@ int main(int argc, char **argv)
         case 'm':
             opts.max_log_bytes = (size_t)strtoull(optarg, NULL, 10);
             break;
+        case 'T':
+            opts.tui = true;
+            break;
         case 'v':
             opts.verbose = true;
             break;
@@ -981,7 +1063,26 @@ int main(int argc, char **argv)
                  opts.proto == PROTO_TCP ? "TCP" : "UDP",
                  opts.tls ? "/TLS" : "");
 
-    if (!opts.quiet) {
+    bool used_tui = false;
+    if (opts.tui) {
+        char mode_full[96];
+
+        snprintf(mode_full, sizeof mode_full, "%s%s", mode_str,
+                 opts.proxy_host ? " via SOCKS5" : "");
+        if (tui_init(mode_full) == 0) {
+            used_tui = true;
+            logbook_set_stream_sink(tui_stream);
+            logbook_set_dgram_sink(tui_datagram);
+            logbook_set_event_sink(tui_event);
+            tui_set_state("starting");
+        } else {
+            fprintf(stderr,
+                    "canyon: warning: TUI unavailable (%s); "
+                    "continuing in log mode\n", tui_error());
+        }
+    }
+
+    if (!opts.quiet && !used_tui) {
         fprintf(stderr,
                 "canyon %s - flooding %s:%d over %s%s\n",
                 CANYON_VERSION, opts.host, opts.port, mode_str,
@@ -1006,7 +1107,17 @@ int main(int argc, char **argv)
 
     run_sessions();
 
+    if (used_tui) {
+        tui_set_state("finished");
+        tui_shutdown();
+    }
+
     logbook_close();
     close(g_randfd);
+
+    if (used_tui && !opts.quiet)
+        printf("canyon: finished - sent %lu chunks (%llu bytes), "
+               "received %llu msgs (%llu bytes)\ncanyon: logs in %s\n",
+               g_sent, g_sent_bytes, g_recv_msgs, g_recv_bytes, opts.outdir);
     return 0;
 }

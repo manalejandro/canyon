@@ -472,6 +472,35 @@ test -s "$TMP"/logs_host/stream-*.log
 grep -q "host:localhost:$PORT_HTTP path:/api" "$TMP"/logs_host/stream-*.log
 echo "OK: HTTP path endpoint + hostname in Host header"
 
+# --- TUI: falls back to log mode when not attached to a terminal --------------
+./canyon -T -H 127.0.0.1 -p "$PORT_TCP" -c 64-256 -n 5 -t 5 -d 50000 \
+    -o "$TMP/logs_tui_pipe" >/dev/null 2>"$TMP/tui_pipe.err"
+grep -qi "tui" "$TMP/tui_pipe.err"
+test -s "$TMP"/logs_tui_pipe/stream-*.log
+echo "OK: TUI falls back to log mode without a terminal"
+
+# --- TUI: pty run shows received data, honours keys and quits on 'q' ----------
+export TERM="${TERM:-xterm}"
+if command -v script >/dev/null 2>&1 &&
+   script --version 2>/dev/null | grep -qi util-linux &&
+   infocmp "$TERM" >/dev/null 2>&1; then
+    t0=$SECONDS
+    ( sleep 1.5; printf 'x'; sleep 0.5; printf 'p'; sleep 0.5; printf 'q' ) |
+        script -qec "./canyon -T -H 127.0.0.1 -p $PORT_TCP -c 64-256 -d 50000 -t 20 -o $TMP/logs_tui_pty" \
+        "$TMP/tty.out" >/dev/null 2>&1
+    t1=$SECONDS
+    [ $((t1 - t0)) -lt 12 ]            # 'q' must stop it well before -t 20
+    grep -q "target 127.0.0.1:$PORT_TCP" "$TMP/tty.out"   # title bar
+    grep -q "received |" "$TMP/tty.out"                   # data pane
+    grep -q "echo:" "$TMP/tty.out"                        # received data on screen
+    grep -q "events" "$TMP/tty.out"                       # events pane
+    grep -q "PAUSED" "$TMP/tty.out"                       # 'p' key
+    grep -q '"type":"end"' "$TMP"/logs_tui_pty/events-*.log
+    echo "OK: TUI shows received data on a pty, honours keys and quits on 'q'"
+else
+    echo "SKIP: TUI pty test (needs util-linux 'script' and terminfo for TERM=$TERM)"
+fi
+
 kill $SERVER_PIDS 2>/dev/null || true
 SERVER_PIDS=""
 

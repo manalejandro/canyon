@@ -32,7 +32,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define CANYON_VERSION "1.1.0"
+#define CANYON_VERSION "1.2.0"
 
 #define DEFAULT_RANDOM_SOURCE "/dev/urandom"
 #define DEFAULT_OUTDIR "canyon-logs"
@@ -88,6 +88,7 @@ typedef struct {
     /* misc */
     bool verbose;
     bool quiet;
+    bool tui;
 } options_t;
 
 extern options_t opts;
@@ -95,6 +96,10 @@ extern volatile sig_atomic_t g_running;
 
 void logmsg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void die(const char *fmt, ...) __attribute__((format(printf, 1, 2))) __attribute__((noreturn));
+
+/* Request a clean shutdown (used by signal handlers and by the TUI 'q'
+ * key): clears g_running and unblocks any pending socket operation. */
+void canyon_stop(void);
 
 uint64_t now_ms(void);
 void sleep_us(long us);
